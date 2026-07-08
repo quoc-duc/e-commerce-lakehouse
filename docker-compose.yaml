@@ -1,0 +1,247 @@
+version: "3.9"
+
+services:
+  minio:
+    hostname: minio
+    image: "minio/minio"
+    container_name: minio
+    ports:
+      - "9001:9001"
+      - "9000:9000"
+    command: [ "server", "/data", "--console-address", ":9001" ]
+    volumes:
+      - miniodata:/data
+    env_file:
+      - .env
+    networks:
+      - data_network
+  
+  spark-master:
+    build:
+      context: ./docker_image/spark
+      dockerfile: ./Dockerfile
+    container_name: "spark-master"
+    ports:
+      - "7077:7077"  # Spark master port
+      - "8081:8080"  # Spark master web UI port
+    expose: 
+      - "7077"
+    environment:
+      # - SPARK_MODE=master
+      # - SPARK_RPC_AUTHENTICATION_ENABLED=no
+      # - SPARK_RPC_ENCRYPTION_ENABLED=no
+      # - SPARK_LOCAL_STORAGE_ENCRYPTION_ENABLED=no
+      # - SPARK_SSL_ENABLED=no
+      # - SPARK_USER=spark
+      - SPARK_USER=spark
+      - SPARK_MASTER_PORT=7077
+      - SPARK_MASTER_WEBUI_PORT=8080
+    volumes:
+      # - ./docker_image/spark/conf/spark-defaults.conf:/opt/bitnami/spark/conf/spark-defaults.conf
+      # - ./docker_image/spark/conf/log4j.properties:/opt/bitnami/spark/conf/log4j.properties
+      - ./docker_image/spark/conf/spark-defaults.conf:/opt/spark/conf/spark-defaults.conf
+      - ./docker_image/spark/conf/log4j.properties:/opt/spark/conf/log4j.properties
+    networks:
+      - data_network
+    command: /opt/spark/bin/spark-class org.apache.spark.deploy.master.Master --host spark-master
+
+  spark-worker:
+    build:
+      context: ./docker_image/spark
+      dockerfile: ./Dockerfile
+    container_name: "spark-worker"
+    depends_on:
+      - spark-master
+    environment:
+      - SPARK_USER=spark
+      - SPARK_WORKER_WEBUI_PORT=8081
+    volumes:
+      - ./docker_image/spark/conf/spark-defaults.conf:/opt/spark/conf/spark-defaults.conf
+      - ./docker_image/spark/conf/log4j.properties:/opt/spark/conf/log4j.properties
+    networks:
+      - data_network
+    # Chỉ định lệnh chạy Worker và trỏ về node Master
+    command: /opt/spark/bin/spark-class org.apache.spark.deploy.worker.Worker spark://spark-master:7077
+    ports:
+      - "8082:8081"
+
+  metabase:
+    image: metabase/metabase:latest
+    container_name: "metabase"
+    ports:
+      - "3000:3000"
+    # env_file:
+    #   - .env
+    environment:
+      MB_DB_TYPE: postgres
+      MB_DB_DBNAME: metabase
+      MB_DB_PORT: 5432
+      MB_DB_USER: admin
+      MB_DB_PASS: admin
+      MB_DB_HOST: de_psql
+    healthcheck:
+      test: curl --fail -I http://localhost:3000/api/health || exit 1
+      interval: 15s
+      timeout: 5s
+      retries: 5
+    # volumes:
+    #   - metabasedata:/metabase-data
+    networks:
+      - data_network
+
+  trino:
+    image: 'trinodb/trino:448'
+    hostname: trino
+    container_name: trino
+    depends_on:
+       - hive-metastore
+       - minio
+    expose:
+      - '8080'
+    ports:
+      - '8080:8080'
+    volumes:
+      - ./trino:/etc/trino
+    networks:
+      - data_network
+  
+  # mysql:
+  #   image: mysql:8.0
+  #   container_name: mysql
+  #   volumes:
+  #     - mysql_h:/var/lib/mysql
+  #     - ./dataset:/tmp/dataset
+  #     - ./load_dataset_into_mysql:/tmp/load_dataset
+  #   ports:
+  #     - "3307:3306"
+  #   # env_file: .env
+  #   environment:
+  #     - MYSQL_DATABASE=mlflowdb
+  #     - MYSQL_ROOT_USER=root
+  #     - MYSQL_USER=admin
+  #     - MYSQL_PASSWORD=admin
+  #     - MYSQL_ROOT_PASSWORD=admin
+  #   networks:
+  #     - data_network
+
+  mariadb:
+    image: mariadb:10.5.16
+    container_name: mariadb
+    volumes:
+      - mariadb:/var/lib/mysql
+    ports:
+      - "3309:3306"
+    env_file:
+      - .env
+    networks:
+      - data_network
+  
+  hive-metastore:
+    container_name: hive-metastore
+    hostname: hive-metastore
+    image: "bitsondatadev/hive-metastore:latest"
+    platform: linux/amd64
+    entrypoint: /entrypoint.sh
+    ports:
+      - "9083:9083"
+    volumes:
+      - ./docker_image/hive-metastore/metastore-site.xml:/opt/apache-hive-metastore-3.0.0-bin/conf/metastore-site.xml:ro
+    environment:
+      METASTORE_DB_HOSTNAME: mariadb
+    networks:
+      - data_network
+    depends_on:
+      - mariadb
+      # - minio
+
+  de_psql:
+    image: postgres:14-alpine
+    container_name: de_psql
+    hostname: de_psql
+    volumes:
+      - postgres_data_h:/var/lib/postgresql/data
+      - ./pg_hba.conf:/tmp/pg_hba.conf
+      # - ./load_dataset:/tmp/load_dataset
+    command: ["postgres", "-c", "hba_file=/tmp/pg_hba.conf"]
+    expose:
+      - "5432"
+    ports:
+      - "5432:5432"
+    env_file: .env
+    networks:
+      - data_network
+
+  de_dagster_dagit:
+    build:
+      context: ./docker_image/dagster
+      dockerfile: Dockerfile
+    entrypoint:
+      - dagit
+      - -h
+      - "0.0.0.0"
+      - -p
+      - "3001"
+      - -w
+      - workspace.yaml
+    container_name: de_dagster_dagit
+    ports:
+      - "3001:3001"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./dagster_home:/opt/dagster/dagster_home
+    env_file:
+      - .env
+    networks:
+      - data_network
+    depends_on:
+      - de_psql
+
+  de_dagster_daemon:
+    build:
+      context: ./docker_image/dagster
+      dockerfile: Dockerfile
+    entrypoint:
+      - dagster-daemon
+      - run
+    container_name: de_dagster_daemon
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./dagster_home:/opt/dagster/dagster_home
+    env_file:
+      - .env
+    networks:
+      - data_network
+    depends_on:
+      - de_psql
+
+  etl_pipeline:
+    build:
+      context: ./etl_pipeline
+      dockerfile: Dockerfile
+    container_name: etl_pipeline
+    image: etl_pipeline:latest
+    user: root
+    volumes:
+      - ./dataset:/opt/dagster/app/data
+      - ./etl_pipeline:/opt/dagster/app/etl_pipeline
+      - ./etl_pipeline/spark-defaults.conf:/usr/local/spark/conf/spark-defaults.conf
+    env_file:
+      - .env
+    expose:
+      - "4000"
+    # command: dagster dev -h 0.0.0.0 -p 4000 -f /opt/dagster/app/etl_pipeline/assets/bronze.py
+    networks:
+      - data_network
+
+networks:
+  data_network:
+    driver: bridge
+    name: data_network
+
+
+volumes:
+  postgres_data_h: {}
+  mysql_h: {}
+  miniodata: {}
+  mariadb: {}
+  # metabasedata: {}
